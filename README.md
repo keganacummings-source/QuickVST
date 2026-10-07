@@ -1,35 +1,31 @@
-# Kyoto VST3 Quick Builder 1.0.4
+# Kyoto VST3 Quick Host
 
-Windows-native JUCE VST3 builder/host.
+A deliberately small Windows VST3 host focused on fast startup and quick plugin loading.
 
-## Drop support
-- GitHub/CMake project folder: build, cache, and launch the first VST3 output.
-- ZIP containing a GitHub/CMake project: extract, locate `CMakeLists.txt`, build, cache, and launch.
-- `.vst3` folder: load it directly.
-- ZIP containing a `.vst3`: extract and load it.
-- `.wav`: play immediately and loop continuously. Press Escape to stop the WAV.
+## Features
 
-## Plugin display
-When a VST3 is loaded, the builder UI is hidden and only the plugin editor is shown inside the window. Press **Escape** to close the plugin and return to the builder.
+- Drag a `.vst3` folder/bundle into the window to load it.
+- Drag a folder containing a `.vst3` bundle; the first VST3 found is loaded.
+- Browser scans:
+  - `C:\Program Files\Common Files\VST3`
+  - `C:\Program Files (x86)\Common Files\VST3`
+- Plugin paths are cached under `%APPDATA%\Kyoto\VST3QuickHost\plugins.txt`.
+- Startup uses the cached list immediately and refreshes the filesystem index afterward.
+- Plugins open in their native JUCE-hosted editor.
+- No web UI, Electron, Chromium, or embedded browser is required.
 
-## Faster compiles
-Dropped projects are configured for speed, not for a whole-program Release link:
+## Important performance note
 
-- Ninja when it is on PATH (`ninja` or `ninja.exe`). The Visual Studio generator is only the fallback, and it gets `/MP`.
-- Job count matches the CPU count.
-- `ccache` or `sccache` is passed as the compiler launcher when installed.
-- Unity builds (`CMAKE_UNITY_BUILD`) batch translation units.
-- `/GL` and `/LTCG` are not enabled. Those flags were the slow rebuild path.
-- JUCE FetchContent is stored once under `%LOCALAPPDATA%\\KyotoVST3QuickBuilder\\fetchcontent` so each dropped project does not re-clone JUCE.
-- Repeat configures set `FETCHCONTENT_UPDATES_DISCONNECTED`.
+The host itself is intentionally lightweight. It cannot make an individual VST3's DSP cheaper: a heavy synth/effect can still consume substantial CPU/RAM. The host avoids unnecessary work, keeps scanning separate from plugin instantiation, and uses the normal realtime audio callback.
 
-Install Ninja and ccache (or sccache) on the build machine for the full speedup. The app's own CMakeLists uses the same cache and drops LTCG.
+## Build
 
-## Build requirements
-Windows 10/11, CMake, and a Visual Studio/MSVC toolchain. The GitHub workflow uses MSVC x64 and Ninja.
+The included GitHub Actions workflow builds the Windows x64 Release package.
 
-```
-powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
-```
+1. Create a GitHub repository.
+2. Upload this project with the same folder structure.
+3. Open **Actions**.
+4. Run **Build Kyoto VST3 Quick Host**.
+5. Download the Windows artifact.
 
-FIXED8: JUCE 8 compatibility fixes for WAV looping, ZIP extraction, file detection, and Escape keyboard handling.
+The build downloads JUCE during CMake configuration.
