@@ -1,30 +1,48 @@
 param(
-  [string]$Source = "."
+    [string]$BuildDir = "build"
 )
 
 $ErrorActionPreference = "Stop"
-$Build = Join-Path $PSScriptRoot "build"
+
+# JUCE 8 requires a supported Microsoft toolchain on Windows.
+# Import the Visual Studio developer environment so CMake/Ninja cannot pick MinGW.
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) {
+    throw "Visual Studio Installer / vswhere.exe was not found. Install Visual Studio with the Desktop development with C++ workload."
+}
+
+$vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsPath) {
+    throw "No Visual Studio installation with MSVC C++ tools was found."
+}
+
+$devCmd = Join-Path $vsPath "Common7\Tools\VsDevCmd.bat"
+if (-not (Test-Path $devCmd)) {
+    throw "VsDevCmd.bat was not found at $devCmd"
+}
+
+# Import the VS x64 environment into this PowerShell process.
+cmd.exe /s /c "`"$devCmd`" -arch=x64 -host_arch=x64 >nul && set" | ForEach-Object {
+    if ($_ -match '^(.*?)=(.*)$') {
+        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+    }
+}
 
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-  throw "CMake is not installed or not on PATH."
+    throw "CMake was not found in PATH."
+}
+if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+    throw "Ninja was not found in PATH. Install Ninja or add it to PATH."
+}
+if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+    throw "MSVC cl.exe was not found after loading Visual Studio."
 }
 
-$Generator = "Visual Studio 17 2022"
-if (Get-Command ninja -ErrorAction SilentlyContinue) {
-  $Generator = "Ninja"
-}
+cmake -S . -B $BuildDir -G Ninja `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_C_COMPILER=cl.exe `
+    -DCMAKE_CXX_COMPILER=cl.exe
 
-if ($Generator -eq "Ninja") {
-  cmake -S $Source -B $Build -G Ninja -DCMAKE_BUILD_TYPE=Release
-  cmake --build $Build --parallel
-} else {
-  cmake -S $Source -B $Build -G $Generator -A x64
-  cmake --build $Build --config Release --parallel
-}
+cmake --build $BuildDir --parallel
 
-$exe = Get-ChildItem $Build -Recurse -Filter "KyotoVST3QuickBuilder.exe" |
-  Select-Object -First 1
-
-if (-not $exe) { throw "Build finished without producing KyotoVST3QuickBuilder.exe" }
-
-Write-Host "READY: $($exe.FullName)" -ForegroundColor Green
+Write-Host "Build complete." -ForegroundColor Green
