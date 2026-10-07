@@ -14,32 +14,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # JUCE 8 does not support MinGW on Windows. This action exposes the
-      # Microsoft x64 compiler environment to CMake/Ninja so CMake cannot
-      # accidentally select C:/mingw64/bin/cc.exe.
-      - name: Enable MSVC x64 environment
+      - name: Enable MSVC x64
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Verify Microsoft compiler
+      - name: Verify toolchain
         shell: pwsh
         run: |
-          Write-Host "Compiler:" 
           where.exe cl.exe
           cl.exe 2>&1 | Select-Object -First 3
-          Write-Host "CMake:" 
           cmake --version
-          Write-Host "Ninja:" 
           ninja --version
 
-      - name: Cache JUCE
+      - name: Cache JUCE source
         uses: actions/cache@v4
         with:
           path: C:\kyoto-juce-cache
-          key: juce-8.0.6-windows-msvc-x64-v2
+          key: juce-8.0.6-windows-msvc-x64-v3
 
-      - name: Configure with MSVC + Ninja
+      - name: Configure
         shell: pwsh
         run: |
           cmake -S . -B build -G Ninja `
@@ -56,7 +50,8 @@ jobs:
       - name: Locate EXE
         shell: pwsh
         run: |
-          $exe = Get-ChildItem build -Recurse -Filter "KyotoVST3QuickBuilder.exe" | Select-Object -First 1
+          $exe = Get-ChildItem build -Recurse -Filter "KyotoVST3QuickBuilder.exe" |
+            Select-Object -First 1
           if (-not $exe) { throw "KyotoVST3QuickBuilder.exe was not produced." }
           New-Item -ItemType Directory -Force release | Out-Null
           Copy-Item $exe.FullName release\KyotoVST3QuickBuilder.exe
@@ -66,28 +61,23 @@ jobs:
         run: |
           @"
           Kyoto VST3 Quick Builder
-          Windows x64 / MSVC
+          Windows x64 / MSVC / JUCE 8.0.6
 
           BUILD MODE:
-          Drop an extracted CMake/GitHub VST3 project onto the window.
-          The builder configures, compiles, saves the .vst3 in its local cache,
-          reports errors in the build console, and opens the result automatically.
+          Drop an extracted GitHub/CMake VST3 project folder.
+          The app configures, compiles, caches the VST3 and launches it.
 
           PLAYER MODE:
-          Turn BUILD MODE off and drop any Windows .vst3 folder to load it natively.
-
-          The GitHub builder uses Microsoft MSVC x64 because JUCE 8 does not support MinGW.
+          Turn BUILD MODE off and drop a Windows .vst3 folder.
           "@ | Set-Content release\README.txt
+          Compress-Archive -Path release\* `
+            -DestinationPath KyotoVST3QuickBuilder-Windows-x64.zip -Force
 
-          Compress-Archive -Path release\* -DestinationPath KyotoVST3QuickBuilder-Windows-x64.zip -Force
-
-      - name: Upload Windows EXE
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: KyotoVST3QuickBuilder-Windows-x64
-          path: |
-            release/KyotoVST3QuickBuilder.exe
-            release/README.txt
+          path: release/*
 
       - name: Upload ZIP
         uses: actions/upload-artifact@v4
