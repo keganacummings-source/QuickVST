@@ -1,379 +1,349 @@
-class BuilderJob> job;
-
-    juce::ToggleButton buildMode;
-    juce::Label modeLabel, status;
-    juce::TextEditor logBox;
-    juce::TextButton closeButton;
-    bool dropActive = false;
-
-    void updateMode()
-    {
-        bool b = buildMode.getToggleState();
-        modeLabel.setText(b ? "BUILD → CACHE → LAUNCH" : "NATIVE VST3 PLAYER",
-                           juce::dontSendNotification);
-        status.setText(b ? "Drop a GitHub/CMake VST3 project here"
-                         : "Drop a .vst3 folder here",
-                       juce::dontSendNotification);
-        repaint();
-    }
-
-    void appendLog(const juce::String& s)
-    {
-        juce::MessageManager::callAsync([this, s] {
-            logBox.moveCaretToEnd();
-            logBox.insertTextAtCaret(s + (s.endsWithChar('\n') ? "" : "\n"));
-        });
-    }
-
-    void loadDroppedPlugin(juce::File file)
-    {
-        if (!file.isDirectory() || !file.hasFileExtension(".vst3")) {
-            status.setText("Normal mode needs a .vst3 folder.", juce::dontSendNotification);
-            return;
-        }
-
-        closePlugin();
-        juce::AudioPluginFormat* vst3 = nullptr;
-        for (int i = 0; i < formatManager.getNumFormats(); ++i)
-            if (formatManager.getFormat(i)->getName().containsIgnoreCase("VST3"))
-                vst3 = formatManager.getFormat(i);
-
-        if (vst3 == nullptr) {
-            status.setText("VST3 format unavailable.", juce::dontSendNotification);
-            return;
-        }
-
-        juce::OwnedArray<juce::PluginDescription> descs;
-        if (!knownPlugins.scanAndAddFile(file, true, descs, *vst3) || descs.isEmpty()) {
-            status.setText("Could not identify that VST3.", juce::dontSendNotification);
-            return;
-        }
-
-        juce::String err;
-        plugin = formatManager.createPluginInstance(*vst3, *descs[0], 48000.0, 512, err);
-        if (plugin == nullptr) {
-            status.setText("VST3 failed to load.", juce::dontSendNotification);
-            appendLog(err);
-            return;
-        }
-
-        plugin->setRateAndBufferSizeDetails(48000.0, 512);
-        player.setProcessor(plugin.get());
-        editor.reset(plugin->createEditorIfNeeded());
-
-        if (editor != nullptr) {
-            addAndMakeVisible(editor.get());
-            editor->setResizable(true, true);
-            status.setText("RUNNING • " + descs[0]->name, juce::dontSendNotification);
-            resized();
-        } else {
-            status.setText("Loaded • plugin has no custom editor", juce::dontSendNotification);
-        }
-        repaint();
-    }
-
-    void closePlugin()
-    {
-        if (editor != nullptr) editor.reset();
-        player.setProcessor(nullptr);
-        plugin.reset();
-        resized();
-    }
-
-    void startBuild(juce::File source)
-    {
-        if (!source.isDirectory()) {
-            status.setText("Drop the extracted GitHub project folder, not a single source file.",
-                           juce::dontSendNotification);
-            return;
-        }
-
-        if (!source.getChildFile("CMakeLists.txt").exists()) {
-            status.setText("No CMakeLists.txt found in the dropped folder.", juce::dontSendNotification);
-            return;
-        }
-
-        closePlugin();
-        logBox.clear();
-        status.setText("Preparing fast incremental build…", juce::dontSendNotification);
-
-        auto name = source.getFileNameWithoutExtension().replaceCharacters(" ", "_");
-        auto cacheRoot = appData().getChildFile("Builds").getChildFile(name);
-        cacheRoot.createDirectory();
-
-        auto buildDir = cacheRoot.getChildFile("build");
-        auto distDir = cacheRoot.getChildFile("dist");
-        buildDir.createDirectory();
-        distDir.createDirectory();
-
-        auto stamp = source.getChildFile(".kyoto-build-stamp.txt");
-        auto signature = makeSignature(source);
-        auto existing = stamp.existsAsFile() ? stamp.loadFileAsString() : juce::String();
-
-        if (existing == signature) {
-            juce::Array<juce::File> cached;
-            findVST3(distDir, cached);
-            if (!cached.isEmpty()) {
-                appendLog("CACHE HIT — skipping compilation.");
-                status.setText("Cached build found • launching…", juce::dontSendNotification);
-                loadDroppedPlugin(cached[0]);
-                return;
-            }
-        }
-
-        stamp.replaceWithText(signature);
-
-        job = std::make_unique<BuilderJob>(source, cacheRoot,
-            [this](const juce::String& s) { appendLog(s); },
-            [this](bool ok, juce::File file, const juce::String& msg) {
-                job.reset();
-                status.setText(msg, juce::dontSendNotification);
-                if (ok) {
-                    appendLog("LAUNCHING " + file.getFullPathName());
-                    loadDroppedPlugin(file);
-                }
-            });
-        job->startThread();
-    }
-
-    static juce::String makeSignature(const juce::File& root)
-    {
-        juce::int64 totalSize = 0;
-        juce::int64 newest = 0;
-        int count = 0;
-        juce::DirectoryIterator it(root, true);
-        while (it.next()) {
-            auto f = it.getFile();
-            if (f.isDirectory()) continue;
-            auto ext = f.getFileExtension().toLowerCase();
-            if (ext == ".cpp" || ext == ".h" || ext == ".hpp" || ext == ".c" ||
-                ext == ".cmake" || ext == ".txt" || f.getFileName() == "CMakeLists.txt") {
-                ++count;
-                totalSize += f.getSize();
-                newest = juce::jmax(newest, f.getLastModificationTime().toMilliseconds());
-            }
-        }
-        return juce::String(count) + ":" + juce::String(totalSize) + ":" + juce::String(newest);
-    }
-
-    static void findVST3(const juce::File& root, juce::Array<juce::File>& out)
-    {
-        juce::DirectoryIterator it(root, true, "*.vst3");
-        while (it.next())
-            if (it.getFile().isDirectory()) out.addIfNotAlreadyThere(it.getFile());
-    }
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HostView)
-};
+#include <JuceHeader.h>
 
 class BuilderJob final : public juce::Thread
 {
 public:
-    BuilderJob(juce::File src, juce::File out,
-               std::function<void(juce::String)> line,
-               std::function<void(bool, juce::File, juce::String)> done)
-        : Thread("VST3 Fast Build"), source(std::move(src)), output(std::move(out)),
-          onLine(std::move(line)), onDone(std::move(done)) {}
+    using LogFn = std::function<void(const juce::String&)>;
+    using DoneFn = std::function<void(bool, juce::File, const juce::String&)>;
+
+    BuilderJob(juce::File sourceRoot, juce::File cacheRoot, LogFn log, DoneFn done)
+        : Thread("Kyoto VST3 Builder"),
+          source(std::move(sourceRoot)),
+          cache(std::move(cacheRoot)),
+          appendLog(std::move(log)),
+          finished(std::move(done))
+    {
+    }
 
     void run() override
     {
-        auto buildDir = output.getChildFile("build");
-        auto distDir = output.getChildFile("dist");
+        const auto buildDir = cache.getChildFile("build");
+        const auto distDir = cache.getChildFile("dist");
         buildDir.createDirectory();
         distDir.createDirectory();
 
-        auto cmake = findCMake();
-        if (cmake.isEmpty()) return finish(false, {}, "CMake was not found on this PC.");
+        appendLog("=== Kyoto VST3 Quick Builder ===");
+        appendLog("Source: " + source.getFullPathName());
+        appendLog("Build:  " + buildDir.getFullPathName());
+        appendLog("");
 
-        bool ninja = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
-                         .getSiblingFile("ninja.exe").exists();
-        auto ninjaOnPath = runCapture("where ninja.exe");
-        if (ninjaOnPath.isNotEmpty()) ninja = true;
+        if (threadShouldExit())
+            return;
 
-        juce::String configure = quote(cmake) + " -S " + quote(source.getFullPathName()) +
-                                 " -B " + quote(buildDir.getFullPathName()) +
-                                 " -DCMAKE_BUILD_TYPE=Release " +
-                                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON";
-        if (ninja) configure += " -G Ninja";
-        else configure += " -G \"Visual Studio 17 2022\" -A x64";
+        const auto cmake = findCMake();
+        if (cmake.isEmpty())
+        {
+            finish(false, {}, "CMake was not found on this PC.");
+            return;
+        }
 
-        if (!execute(configure))
-            return finish(false, {}, "BUILD ERROR • CMake configure failed.");
+        appendLog("CMake: " + cmake);
 
-        juce::String build = quote(cmake) + " --build " + quote(buildDir.getFullPathName()) +
-                             " --config Release --parallel";
-        if (!execute(build))
-            return finish(false, {}, "BUILD ERROR • compilation failed.");
+        // Prefer Ninja when it is already installed. Otherwise use the
+        // Visual Studio 2022 generator, which requires no environment setup.
+        const auto ninja = findOnPath("ninja.exe");
+        juce::String configure;
 
-        juce::Array<juce::File> bundles;
-        findVST3(buildDir, bundles);
-        if (bundles.isEmpty())
-            return finish(false, {}, "BUILD ERROR • no .vst3 bundle was produced.");
+        if (ninja.isNotEmpty())
+        {
+            appendLog("Generator: Ninja (fast incremental mode)");
+            configure = quote(cmake) + " -S " + quote(source.getFullPathName())
+                      + " -B " + quote(buildDir.getFullPathName())
+                      + " -G Ninja -DCMAKE_BUILD_TYPE=Release";
+        }
+        else
+        {
+            appendLog("Generator: Visual Studio 17 2022 (Ninja not installed)");
+            configure = quote(cmake) + " -S " + quote(source.getFullPathName())
+                      + " -B " + quote(buildDir.getFullPathName())
+                      + " -G \"Visual Studio 17 2022\" -A x64";
+        }
 
-        auto selected = bundles[0];
-        auto target = distDir.getChildFile(selected.getFileName());
-        target.deleteRecursively();
-        if (!selected.copyDirectoryTo(target))
-            return finish(false, {}, "BUILD ERROR • could not save the VST3 build.");
+        appendLog("");
+        appendLog("> " + configure);
 
-        finish(true, target, "BUILD COMPLETE • launching plugin…");
+        int exitCode = -1;
+        if (!runCapture(configure, exitCode) || exitCode != 0)
+        {
+            finish(false, {}, "CMake configuration failed (exit " + juce::String(exitCode) + ").");
+            return;
+        }
+
+        if (threadShouldExit())
+            return;
+
+        juce::String buildCommand;
+        if (ninja.isNotEmpty())
+            buildCommand = quote(cmake) + " --build " + quote(buildDir.getFullPathName())
+                         + " --parallel";
+        else
+            buildCommand = quote(cmake) + " --build " + quote(buildDir.getFullPathName())
+                         + " --config Release --parallel";
+
+        appendLog("");
+        appendLog("> " + buildCommand);
+
+        if (!runCapture(buildCommand, exitCode) || exitCode != 0)
+        {
+            finish(false, {}, "VST3 build failed (exit " + juce::String(exitCode) + ").");
+            return;
+        }
+
+        if (threadShouldExit())
+            return;
+
+        juce::Array<juce::File> plugins;
+        findVST3(buildDir, plugins);
+
+        if (plugins.isEmpty())
+        {
+            finish(false, {}, "Build completed, but no .vst3 bundle was found.");
+            return;
+        }
+
+        // Select the newest VST3 output and copy it into the persistent cache.
+        std::sort(plugins.begin(), plugins.end(),
+                  [](const juce::File& a, const juce::File& b)
+                  {
+                      return a.getLastModificationTime() > b.getLastModificationTime();
+                  });
+
+        const auto builtPlugin = plugins.getFirst();
+        auto cachedPlugin = distDir.getChildFile(builtPlugin.getFileName());
+
+        if (cachedPlugin.exists())
+            cachedPlugin.deleteRecursively();
+
+        if (!builtPlugin.copyDirectoryTo(cachedPlugin))
+        {
+            finish(false, {}, "Build succeeded, but the VST3 could not be copied into the cache.");
+            return;
+        }
+
+        appendLog("");
+        appendLog("BUILD SUCCESS");
+        appendLog("Cached: " + cachedPlugin.getFullPathName());
+
+        finish(true, cachedPlugin, "Build succeeded • launching plugin…");
     }
 
 private:
-    juce::File source, output;
-    std::function<void(juce::String)> onLine;
-    std::function<void(bool, juce::File, juce::String)> onDone;
+    juce::File source, cache;
+    LogFn appendLog;
+    DoneFn finished;
 
-    static juce::String quote(const juce::String& s) { return "\"" + s + "\""; }
-
-    juce::String findCMake()
+    void finish(bool ok, const juce::File& file, const juce::String& message)
     {
-        auto r = runCapture("where cmake.exe");
-        if (r.isNotEmpty()) return r.upToFirstOccurrenceOf("\r", false, false)
-                                     .upToFirstOccurrenceOf("\n", false, false).trim();
+        if (finished)
+            juce::MessageManager::callAsync(
+                [done = finished, ok, file, message] { done(ok, file, message); });
+    }
+
+    static juce::String quote(const juce::String& value)
+    {
+        return "\"" + value.replace("\"", "\\\"") + "\"";
+    }
+
+    static juce::String findOnPath(const juce::String& exe)
+    {
+        auto env = juce::SystemStats::getEnvironmentVariable("PATH", {});
+        for (auto part : juce::StringArray::fromTokens(env, ";", ""))
+        {
+            juce::File candidate(part.trim()).getChildFile(exe);
+            if (candidate.existsAsFile())
+                return candidate.getFullPathName();
+        }
         return {};
     }
 
-    juce::String runCapture(const juce::String& command)
+    static juce::String findCMake()
     {
-        juce::ChildProcess p;
-        if (!p.start(command)) return {};
-        p.waitForProcessToFinish(10000);
-        return p.readAllProcessOutput().trim();
+        auto path = findOnPath("cmake.exe");
+        if (path.isNotEmpty())
+            return path;
+
+        const juce::StringArray common =
+        {
+            R"(C:\Program Files\CMake\bin\cmake.exe)",
+            R"(C:\Program Files (x86)\CMake\bin\cmake.exe)"
+        };
+
+        for (const auto& p : common)
+            if (juce::File(p).existsAsFile())
+                return p;
+
+        return {};
     }
 
-    bool execute(const juce::String& command)
+    bool runCapture(const juce::String& command, int& exitCode)
     {
-        onLine("\n> " + command + "\n");
-        juce::ChildProcess p;
-        if (!p.start(command)) {
-            onLine("Could not start build command.\n");
+        juce::ChildProcess process;
+
+        if (!process.start(command, juce::ChildProcess::wantStdOut
+                                      | juce::ChildProcess::wantStdErr))
+        {
+            appendLog("Could not start process.");
+            exitCode = -1;
             return false;
         }
 
-        char buffer[8192];
-        while (p.isRunning() && !threadShouldExit()) {
-            auto bytes = p.readProcessOutput(buffer, (int) sizeof(buffer));
-            if (bytes > 0)
-                onLine(juce::String::fromUTF8(buffer, bytes));
-            wait(8);
+        char buffer[4096];
+
+        while (!threadShouldExit())
+        {
+            const int n = process.readProcessOutput(buffer, sizeof(buffer) - 1);
+            if (n > 0)
+            {
+                buffer[n] = 0;
+                appendLog(juce::String::fromUTF8(buffer));
+            }
+
+            if (!process.isRunning())
+                break;
+
+            wait(10);
         }
 
-        auto text = p.readAllProcessOutput();
-        if (text.isNotEmpty()) onLine(text);
-        return !threadShouldExit() && p.getExitCode() == 0;
+        exitCode = process.getExitCode();
+        return !threadShouldExit();
     }
 
     static void findVST3(const juce::File& root, juce::Array<juce::File>& out)
     {
-        juce::DirectoryIterator it(root, true, "*.vst3");
-        while (it.next())
-            if (it.getFile().isDirectory()) out.addIfNotAlreadyThere(it.getFile());
-    }
+        juce::DirectoryIterator it(root, true, "*.vst3",
+                                   juce::File::findFilesAndDirectories);
 
-    void finish(bool ok, juce::File f, juce::String message)
-    {
-        juce::MessageManager::callAsync([cb=onDone, ok, f, message] { cb(ok, f, message); });
+        while (it.next())
+        {
+            if (it.getFile().isDirectory())
+                out.add(it.getFile());
+        }
     }
 };
 
-
-class HostView final : public juce::Component, public juce::DragAndDropTarget
+class HostView final : public juce::Component,
+                       public juce::FileDragAndDropTarget
 {
 public:
     HostView()
     {
-        setOpaque(true);
-        formatManager.addDefaultFormats();
-        audioDeviceManager.initialiseWithDefaultDevices(2, 2);
-        audioDeviceManager.addAudioCallback(&player);
-
+        addAndMakeVisible(buildMode);
         buildMode.setButtonText("BUILD MODE");
         buildMode.setToggleState(true, juce::dontSendNotification);
         buildMode.onClick = [this] { updateMode(); };
-        addAndMakeVisible(buildMode);
 
-        status.setText("Drop a GitHub/CMake VST3 project here", juce::dontSendNotification);
-        status.setJustificationType(juce::Justification::centred);
-        addAndMakeVisible(status);
-
-        modeLabel.setJustificationType(juce::Justification::centred);
         addAndMakeVisible(modeLabel);
+        modeLabel.setFont(juce::FontOptions(18.0f).withStyle("bold"));
 
+        addAndMakeVisible(status);
+        status.setJustificationType(juce::Justification::centredLeft);
+
+        addAndMakeVisible(logBox);
         logBox.setMultiLine(true);
         logBox.setReadOnly(true);
         logBox.setScrollbarsShown(true);
-        logBox.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff080a0d));
-        logBox.setColour(juce::TextEditor::textColourId, juce::Colours::lightgrey);
-        addAndMakeVisible(logBox);
+        logBox.setFont(juce::FontOptions(13.0f));
 
-        closeButton.setButtonText("STOP / CLOSE");
-        closeButton.onClick = [this] { closePlugin(); };
         addAndMakeVisible(closeButton);
+        closeButton.setButtonText("Unload VST3");
+        closeButton.onClick = [this] { closePlugin(); };
+
+        formatManager.addDefaultFormats();
+
+        audioDeviceManager.initialiseWithDefaultDevices(0, 2);
+        audioDeviceManager.addAudioCallback(&player);
 
         updateMode();
+        setWantsKeyboardFocus(true);
     }
 
     ~HostView() override
     {
-        if (job != nullptr) {
-            job->stopThread(2000);
-            job.reset();
-        }
+        if (job != nullptr)
+            job->stopThread(3000);
+
         closePlugin();
         audioDeviceManager.removeAudioCallback(&player);
-        audioDeviceManager.closeAudioDevice();
     }
 
-    bool isInterestedInFileDrag(const juce::StringArray& files) override
+    bool isInterestedInFileDrag(const juce::StringArray&) override
     {
-        return !files.isEmpty();
+        return true;
     }
 
-    void itemDragEnter(const juce::DragAndDropTarget::SourceDetails&) override
+    void fileDragEnter(const juce::StringArray&, int, int) override
     {
-        dropActive = true; repaint();
+        dropActive = true;
+        repaint();
     }
-    void itemDragExit(const juce::DragAndDropTarget::SourceDetails&) override
-    {
-        dropActive = false; repaint();
-    }
-    void itemDropped(const juce::DragAndDropTarget::SourceDetails& details) override
+
+    void fileDragExit(const juce::StringArray&) override
     {
         dropActive = false;
-        if (details.files.isEmpty()) return;
+        repaint();
+    }
 
-        auto f = juce::File(details.files[0]);
-        if (buildMode.getToggleState())
-            startBuild(f);
+    void filesDropped(const juce::StringArray& files, int, int) override
+    {
+        dropActive = false;
+
+        if (files.isEmpty())
+            return;
+
+        juce::File dropped(files[0]);
+
+        if (!buildMode.getToggleState())
+        {
+            auto vst = findVST3FromDrop(dropped);
+            if (vst.exists())
+                loadDroppedPlugin(vst);
+            else
+                status.setText("Drop a .vst3 folder.", juce::dontSendNotification);
+
+            repaint();
+            return;
+        }
+
+        // Accept either an extracted GitHub folder or a folder containing one.
+        auto source = findProjectRoot(dropped);
+
+        if (source.exists())
+            startBuild(source);
         else
-            loadDroppedPlugin(f);
+            status.setText("No CMakeLists.txt found in the dropped folder.",
+                           juce::dontSendNotification);
+
+        repaint();
     }
 
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour(0xff101318));
-        auto drop = getLocalBounds().reduced(20);
-        drop.removeFromTop(85);
-        drop.removeFromBottom(180);
+        g.fillAll(juce::Colour(0xff0b0d10));
 
-        g.setColour(dropActive ? juce::Colour(0xff315b80) : juce::Colour(0xff1c232c));
-        g.fillRoundedRectangle(drop.toFloat(), 18.0f);
-        g.setColour(juce::Colours::white.withAlpha(0.9f));
-        g.drawRoundedRectangle(drop.toFloat(), 18.0f, 2.0f);
+        auto area = getLocalBounds().reduced(16);
+        g.setColour(juce::Colour(0xff171b22));
+        g.fillRoundedRectangle(area.toFloat(), 14.0f);
 
-        g.setFont(25.0f);
-        g.drawText(buildMode.getToggleState() ? "DROP VST3 SOURCE FOLDER" : "DROP A .VST3 FOLDER",
-                   drop, juce::Justification::centredTop);
-        g.setFont(15.0f);
+        auto drop = area.reduced(16);
+        g.setColour(dropActive ? juce::Colour(0xff303947) : juce::Colour(0xff11151b));
+        g.fillRoundedRectangle(drop.toFloat(), 12.0f);
+
+        g.setColour(juce::Colours::white);
+        g.setFont(juce::FontOptions(26.0f).withStyle("bold"));
+        g.drawText("Kyoto VST3 Quick Builder",
+                   drop.withTrimmedTop(85).withHeight(45),
+                   juce::Justification::centred);
+
+        g.setFont(juce::FontOptions(15.0f));
         g.setColour(juce::Colours::lightgrey);
         g.drawText(buildMode.getToggleState()
-                       ? "CMake / JUCE / GitHub folders are supported • build is cached • successful builds launch automatically"
-                       : "Loads the native VST3 editor and audio engine directly",
-                   drop.reduced(20).withTrimmedTop(45),
+                       ? "Drop a GitHub/CMake VST3 project • compile • cache • launch"
+                       : "Drop a Windows .vst3 folder • load it as a native plugin",
+                   drop.reduced(20).withTrimmedTop(135),
                    juce::Justification::centredTop);
 
-        if (dropActive) {
+        if (dropActive)
+        {
             g.setColour(juce::Colours::white.withAlpha(0.12f));
             g.fillRoundedRectangle(drop.reduced(6).toFloat(), 14.0f);
         }
@@ -382,17 +352,18 @@ public:
     void resized() override
     {
         auto r = getLocalBounds().reduced(16);
-        auto top = r.removeFromTop(64);
-        buildMode.setBounds(top.removeFromLeft(150));
-        modeLabel.setBounds(top.removeFromLeft(240));
+        auto top = r.removeFromTop(58);
+
+        buildMode.setBounds(top.removeFromLeft(145));
+        modeLabel.setBounds(top.removeFromLeft(270));
         closeButton.setBounds(top.removeFromRight(140));
 
-        auto bottom = r.removeFromBottom(165);
+        auto bottom = r.removeFromBottom(180);
         logBox.setBounds(bottom);
-        status.setBounds(r.removeFromBottom(38));
+        status.setBounds(r.removeFromBottom(34));
 
         if (editor != nullptr)
-            editor->setBounds(r.reduced(5));
+            editor->setBounds(r.reduced(8));
     }
 
 private:
@@ -400,15 +371,273 @@ private:
     juce::AudioDeviceManager audioDeviceManager;
     juce::AudioProcessorPlayer player;
     juce::KnownPluginList knownPlugins;
+
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
-    std::unique_ptr<
+    std::unique_ptr<BuilderJob> job;
+
+    juce::ToggleButton buildMode;
+    juce::Label modeLabel, status;
+    juce::TextEditor logBox;
+    juce::TextButton closeButton;
+    bool dropActive = false;
+
+    static juce::File appData()
+    {
+        auto dir = juce::File::getSpecialLocation(
+            juce::File::userApplicationDataDirectory)
+            .getChildFile("KyotoVST3QuickBuilder");
+        dir.createDirectory();
+        return dir;
+    }
+
+    void updateMode()
+    {
+        const bool build = buildMode.getToggleState();
+
+        modeLabel.setText(build ? "BUILD → CACHE → LAUNCH"
+                                : "NATIVE VST3 PLAYER",
+                           juce::dontSendNotification);
+
+        status.setText(build ? "Drop an extracted GitHub/CMake project folder"
+                             : "Drop a .vst3 folder",
+                       juce::dontSendNotification);
+        repaint();
+    }
+
+    void appendLog(const juce::String& text)
+    {
+        juce::MessageManager::callAsync([this, text]
+        {
+            logBox.moveCaretToEnd();
+            logBox.insertTextAtCaret(text.endsWithChar('\n') ? text : text + "\n");
+        });
+    }
+
+    static juce::File findProjectRoot(const juce::File& dropped)
+    {
+        if (!dropped.isDirectory())
+            return {};
+
+        if (dropped.getChildFile("CMakeLists.txt").existsAsFile())
+            return dropped;
+
+        juce::Array<juce::File> children;
+        for (juce::DirectoryIterator it(dropped, false, "*", juce::File::findDirectories);
+             it.next())
+            children.add(it.getFile());
+
+        for (auto& child : children)
+            if (child.getChildFile("CMakeLists.txt").existsAsFile())
+                return child;
+
+        return {};
+    }
+
+    static juce::File findVST3FromDrop(const juce::File& dropped)
+    {
+        if (dropped.isDirectory() && dropped.hasFileExtension(".vst3"))
+            return dropped;
+
+        if (!dropped.isDirectory())
+            return {};
+
+        juce::Array<juce::File> found;
+        juce::DirectoryIterator it(dropped, true, "*.vst3",
+                                   juce::File::findFilesAndDirectories);
+
+        while (it.next())
+            if (it.getFile().isDirectory())
+                found.add(it.getFile());
+
+        return found.isEmpty() ? juce::File() : found.getFirst();
+    }
+
+    static juce::String makeSignature(const juce::File& root)
+    {
+        juce::int64 size = 0;
+        juce::int64 newest = 0;
+        int count = 0;
+
+        juce::DirectoryIterator it(root, true, "*",
+                                   juce::File::findFiles);
+        while (it.next())
+        {
+            auto file = it.getFile();
+            const auto path = file.getFullPathName();
+
+            if (path.containsIgnoreCase("\\build\\")
+                || path.containsIgnoreCase("/build/")
+                || path.containsIgnoreCase("\\.git\\")
+                || path.containsIgnoreCase("/.git/"))
+                continue;
+
+            size += file.getSize();
+            newest = juce::jmax(newest,
+                                file.getLastModificationTime().toMilliseconds());
+            ++count;
+        }
+
+        return juce::String(count) + ":" + juce::String(size) + ":"
+             + juce::String(newest);
+    }
+
+    static void findVST3(const juce::File& root, juce::Array<juce::File>& out)
+    {
+        juce::DirectoryIterator it(root, true, "*.vst3",
+                                   juce::File::findFilesAndDirectories);
+
+        while (it.next())
+            if (it.getFile().isDirectory())
+                out.add(it.getFile());
+    }
+
+    void startBuild(const juce::File& source)
+    {
+        if (job != nullptr)
+        {
+            status.setText("A build is already running.", juce::dontSendNotification);
+            return;
+        }
+
+        closePlugin();
+        logBox.clear();
+        status.setText("Preparing incremental build…", juce::dontSendNotification);
+
+        auto name = source.getFileName().replaceCharacters(" ", "_")
+                    .replaceCharacters("\\/:*?\"<>|", "_________");
+
+        auto cacheRoot = appData().getChildFile("Builds").getChildFile(name);
+        cacheRoot.createDirectory();
+
+        const auto signature = makeSignature(source);
+        const auto stamp = cacheRoot.getChildFile("source.signature.txt");
+        const auto dist = cacheRoot.getChildFile("dist");
+
+        if (stamp.existsAsFile() && stamp.loadFileAsString() == signature)
+        {
+            juce::Array<juce::File> cached;
+            findVST3(dist, cached);
+
+            if (!cached.isEmpty())
+            {
+                appendLog("CACHE HIT — source unchanged.");
+                status.setText("Cached build found • launching…",
+                               juce::dontSendNotification);
+                loadDroppedPlugin(cached.getFirst());
+                return;
+            }
+        }
+
+        job = std::make_unique<BuilderJob>(
+            source, cacheRoot,
+            [this](const juce::String& s) { appendLog(s); },
+            [this, stamp, signature](bool ok, juce::File file, const juce::String& msg)
+            {
+                job.reset();
+
+                if (ok)
+                {
+                    stamp.replaceWithText(signature);
+                    status.setText(msg, juce::dontSendNotification);
+                    loadDroppedPlugin(file);
+                }
+                else
+                {
+                    status.setText(msg, juce::dontSendNotification);
+                }
+            });
+
+        job->startThread();
+    }
+
+    void loadDroppedPlugin(const juce::File& file)
+    {
+        if (!file.isDirectory() || !file.hasFileExtension(".vst3"))
+        {
+            status.setText("Not a valid .vst3 folder.", juce::dontSendNotification);
+            return;
+        }
+
+        closePlugin();
+
+        juce::AudioPluginFormat* vst3 = nullptr;
+        for (int i = 0; i < formatManager.getNumFormats(); ++i)
+        {
+            auto* format = formatManager.getFormat(i);
+            if (format->getName().containsIgnoreCase("VST3"))
+            {
+                vst3 = format;
+                break;
+            }
+        }
+
+        if (vst3 == nullptr)
+        {
+            status.setText("VST3 support is unavailable in this build.",
+                           juce::dontSendNotification);
+            return;
+        }
+
+        juce::OwnedArray<juce::PluginDescription> descriptions;
+
+        if (!knownPlugins.scanAndAddFile(file, true, descriptions, *vst3)
+            || descriptions.isEmpty())
+        {
+            status.setText("Could not identify the VST3.",
+                           juce::dontSendNotification);
+            return;
+        }
+
+        juce::String error;
+        plugin = formatManager.createPluginInstance(
+            *descriptions[0], 48000.0, 512, error);
+
+        if (plugin == nullptr)
+        {
+            status.setText("VST3 failed to load.", juce::dontSendNotification);
+            appendLog(error);
+            return;
+        }
+
+        plugin->setRateAndBufferSizeDetails(48000.0, 512);
+        player.setProcessor(plugin.get());
+
+        editor.reset(plugin->createEditorIfNeeded());
+
+        if (editor != nullptr)
+        {
+            addAndMakeVisible(editor.get());
+            editor->setResizable(true, true);
+            status.setText("RUNNING • " + descriptions[0]->name,
+                           juce::dontSendNotification);
+            resized();
+        }
+        else
+        {
+            status.setText("Loaded • plugin has no custom editor",
+                           juce::dontSendNotification);
+        }
+
+        repaint();
+    }
+
+    void closePlugin()
+    {
+        editor.reset();
+        player.setProcessor(nullptr);
+        plugin.reset();
+        resized();
+    }
+};
+
 class MainWindow final : public juce::DocumentWindow
 {
 public:
     MainWindow()
         : DocumentWindow("Kyoto VST3 Quick Builder",
-                         juce::Colour(0xff0b0d10), DocumentWindow::allButtons)
+                         juce::Colour(0xff0b0d10),
+                         DocumentWindow::allButtons)
     {
         setContentOwned(new HostView(), true);
         setResizable(true, true);
@@ -421,19 +650,32 @@ public:
     {
         juce::JUCEApplication::getInstance()->systemRequestedQuit();
     }
-
-private:
 };
 
 class KyotoApp final : public juce::JUCEApplication
 {
 public:
-    const juce::String getApplicationName() override { return "Kyoto VST3 Quick Builder"; }
-    const juce::String getApplicationVersion() override { return "1.0.0"; }
+    const juce::String getApplicationName() override
+    {
+        return "Kyoto VST3 Quick Builder";
+    }
+
+    const juce::String getApplicationVersion() override
+    {
+        return "1.0.1";
+    }
+
     bool moreThanOneInstanceAllowed() override { return true; }
 
-    void initialise(const juce::String&) override { window = std::make_unique<MainWindow>(); }
-    void shutdown() override { window.reset(); }
+    void initialise(const juce::String&) override
+    {
+        window = std::make_unique<MainWindow>();
+    }
+
+    void shutdown() override
+    {
+        window.reset();
+    }
 
 private:
     std::unique_ptr<MainWindow> window;
