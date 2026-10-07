@@ -149,7 +149,7 @@ private:
         auto env = juce::SystemStats::getEnvironmentVariable("PATH", {});
         for (auto part : juce::StringArray::fromTokens(env, ";", ""))
         {
-            juce::File candidate(part.trim()).getChildFile(exe);
+            auto candidate = juce::File(part.trim()).getChildFile(exe);
             if (candidate.existsAsFile())
                 return candidate.getFullPathName();
         }
@@ -423,8 +423,8 @@ private:
             return dropped;
 
         juce::Array<juce::File> children;
-        for (juce::DirectoryIterator it(dropped, false, "*", juce::File::findDirectories);
-             it.next())
+        juce::DirectoryIterator it(dropped, false, "*", juce::File::findDirectories);
+        while (it.next())
             children.add(it.getFile());
 
         for (auto& child : children)
@@ -581,7 +581,7 @@ private:
 
         juce::OwnedArray<juce::PluginDescription> descriptions;
 
-        if (!knownPlugins.scanAndAddFile(file, true, descriptions, *vst3)
+        if (!knownPlugins.scanAndAddFile(file.getFullPathName(), true, descriptions, *vst3)
             || descriptions.isEmpty())
         {
             status.setText("Could not identify the VST3.",
