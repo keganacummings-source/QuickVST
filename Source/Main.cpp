@@ -124,7 +124,7 @@ public:
         appendLog("BUILD SUCCESS");
         appendLog("Cached: " + cachedPlugin.getFullPathName());
 
-        finish(true, cachedPlugin, "Build succeeded • launching plugin…");
+        finish(true, cachedPlugin, "Build succeeded - launching plugin...");
     }
 
 private:
@@ -233,7 +233,8 @@ public:
         buildMode.onClick = [this] { updateMode(); };
 
         addAndMakeVisible(modeLabel);
-        modeLabel.setFont(juce::FontOptions(18.0f).withStyle("bold"));
+        modeLabel.setFont(juce::FontOptions(16.0f).withStyle("bold"));
+        modeLabel.setColour(juce::Label::textColourId, juce::Colours::white);
 
         addAndMakeVisible(status);
         status.setJustificationType(juce::Justification::centredLeft);
@@ -243,9 +244,16 @@ public:
         logBox.setReadOnly(true);
         logBox.setScrollbarsShown(true);
         logBox.setFont(juce::FontOptions(13.0f));
+        logBox.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff172027));
+        logBox.setColour(juce::TextEditor::outlineColourId, juce::Colour(0xff66717a));
+        logBox.setColour(juce::TextEditor::textColourId, juce::Colours::white);
+
+        status.setFont(juce::FontOptions(14.0f));
 
         addAndMakeVisible(closeButton);
         closeButton.setButtonText("Unload VST3");
+        closeButton.setEnabled(false);
+        closeButton.setVisible(false);
         closeButton.onClick = [this] { closePlugin(); };
 
         formatManager.addDefaultFormats();
@@ -253,8 +261,10 @@ public:
         audioDeviceManager.initialiseWithDefaultDevices(0, 2);
         audioDeviceManager.addAudioCallback(&player);
 
-        updateMode();
         setWantsKeyboardFocus(true);
+        setFocusContainerType(juce::Component::FocusContainerType::keyboardFocusContainer);
+        addKeyListener(this);
+        updateMode();
     }
 
     ~HostView() override
@@ -262,8 +272,10 @@ public:
         if (job != nullptr)
             job->stopThread(3000);
 
+        stopWav();
         closePlugin();
         audioDeviceManager.removeAudioCallback(&player);
+        removeKeyListener(this);
     }
 
     bool isInterestedInFileDrag(const juce::StringArray&) override
@@ -290,7 +302,35 @@ public:
         if (files.isEmpty())
             return;
 
-        juce::File dropped(files[0]);
+        const juce::File dropped(files[0]);
+
+        if (dropped.isFile() && dropped.hasFileExtension(".wav"))
+        {
+            playWav(dropped);
+            repaint();
+            return;
+        }
+
+        if (dropped.isDirectory() && dropped.hasFileExtension(".vst3"))
+        {
+            loadDroppedPlugin(dropped);
+            repaint();
+            return;
+        }
+
+        if (dropped.isFile() && dropped.hasFileExtension(".vst3"))
+        {
+            loadDroppedPlugin(dropped.getParentDirectory().getChildFile(dropped.getFileName()));
+            repaint();
+            return;
+        }
+
+        if (dropped.isFile() && dropped.hasFileExtension(".zip"))
+        {
+            extractAndHandleZip(dropped);
+            repaint();
+            return;
+        }
 
         if (!buildMode.getToggleState())
         {
@@ -298,22 +338,98 @@ public:
             if (vst.exists())
                 loadDroppedPlugin(vst);
             else
-                status.setText("Drop a .vst3 folder.", juce::dontSendNotification);
+                status.setText("No .vst3 plugin found in that item.", juce::dontSendNotification);
 
             repaint();
             return;
         }
 
-        // Accept either an extracted GitHub folder or a folder containing one.
         auto source = findProjectRoot(dropped);
 
         if (source.exists())
             startBuild(source);
         else
-            status.setText("No CMakeLists.txt found in the dropped folder.",
-                           juce::dontSendNotification);
+        {
+            // Build mode can also open an already-built plugin dropped in a folder.
+            auto vst = findVST3FromDrop(dropped);
+            if (vst.exists())
+                loadDroppedPlugin(vst);
+            else
+                status.setText("No CMakeLists.txt or .vst3 found in the dropped item.",
+                               juce::dontSendNotification);
+        }
 
         repaint();
+    }
+
+    void extractAndHandleZip(const juce::File& zipFile)
+    {
+        status.setText("Extracting ZIP...", juce::dontSendNotification);
+        logBox.clear();
+        appendLog("ZIP: " + zipFile.getFullPathName());
+
+        auto incoming = appData().getChildFile("Incoming");
+        incoming.createDirectory();
+
+        const auto folderName = zipFile.getFileNameWithoutExtension()
+                                    .replaceCharacters(" ", "_")
+                                    .replaceCharacters("\\/:*?\"<>|", "_");
+        auto destination = incoming.getChildFile(folderName + "_" +
+                                                  juce::String(juce::Time::currentTimeMillis()));
+        destination.createDirectory();
+
+        juce::ZipFile archive(zipFile);
+        juce::String error;
+
+        if (!archive.uncompressTo(destination, true, &error))
+        {
+            appendLog("ZIP extraction failed: " + error);
+            status.setText("Could not extract ZIP.", juce::dontSendNotification);
+            return;
+        }
+
+        appendLog("Extracted to: " + destination.getFullPathName());
+
+        auto source = findProjectRoot(destination);
+        auto vst = findVST3FromDrop(destination);
+
+        if (buildMode.getToggleState() && source.exists())
+        {
+            startBuild(source);
+        }
+        else if (vst.exists())
+        {
+            loadDroppedPlugin(vst);
+        }
+        else if (buildMode.getToggleState())
+        {
+            status.setText("ZIP extracted, but no CMakeLists.txt or .vst3 was found.",
+                           juce::dontSendNotification);
+        }
+        else
+        {
+            status.setText("ZIP extracted, but no .vst3 plugin was found.",
+                           juce::dontSendNotification);
+        }
+    }
+
+    bool keyPressed(const juce::KeyPress& key, juce::Component*) override
+    {
+        if (plugin != nullptr && key.getKeyCode() == juce::KeyPress::escapeKey)
+        {
+            escapeClose();
+            return true;
+        }
+
+        if (wavActive && key.getKeyCode() == juce::KeyPress::escapeKey)
+        {
+            stopWav();
+            status.setText("WAV stopped - ready for another drop", juce::dontSendNotification);
+            repaint();
+            return true;
+        }
+
+        return false;
     }
 
     void paint(juce::Graphics& g) override
@@ -337,8 +453,8 @@ public:
         g.setFont(juce::FontOptions(15.0f));
         g.setColour(juce::Colours::lightgrey);
         g.drawText(buildMode.getToggleState()
-                       ? "Drop a GitHub/CMake VST3 project • compile • cache • launch"
-                       : "Drop a Windows .vst3 folder • load it as a native plugin",
+                       ? "Drop a GitHub project or ZIP - build - cache - launch"
+                       : "Drop a .vst3 folder or ZIP - load it as a native plugin",
                    drop.reduced(20).withTrimmedTop(135),
                    juce::Justification::centredTop);
 
@@ -346,16 +462,26 @@ public:
         {
             g.setColour(juce::Colours::white.withAlpha(0.12f));
             g.fillRoundedRectangle(drop.reduced(6).toFloat(), 14.0f);
+            g.setColour(juce::Colours::white);
+            g.setFont(juce::FontOptions(18.0f).withStyle("bold"));
+            g.drawText("DROP HERE", drop.reduced(40).withCentre(drop.getCentre()).withHeight(40),
+                       juce::Justification::centred);
         }
     }
 
     void resized() override
     {
+        if (plugin != nullptr && editor != nullptr)
+        {
+            editor->setBounds(getLocalBounds());
+            return;
+        }
+
         auto r = getLocalBounds().reduced(16);
         auto top = r.removeFromTop(58);
 
-        buildMode.setBounds(top.removeFromLeft(145));
-        modeLabel.setBounds(top.removeFromLeft(270));
+        buildMode.setBounds(top.removeFromLeft(140));
+        modeLabel.setBounds(top.removeFromLeft(360));
         closeButton.setBounds(top.removeFromRight(140));
 
         auto bottom = r.removeFromBottom(180);
@@ -366,11 +492,28 @@ public:
             editor->setBounds(r.reduced(8));
     }
 
+public:
+    void escapeClose()
+    {
+        if (plugin != nullptr)
+        {
+            closePlugin();
+            setWantsKeyboardFocus(true);
+            grabKeyboardFocus();
+            status.setText("Plugin closed - ready for another drop", juce::dontSendNotification);
+            repaint();
+        }
+    }
+
 private:
     juce::AudioPluginFormatManager formatManager;
     juce::AudioDeviceManager audioDeviceManager;
     juce::AudioProcessorPlayer player;
     juce::KnownPluginList knownPlugins;
+
+    juce::AudioSourcePlayer wavPlayer;
+    std::unique_ptr<juce::AudioFormatReaderSource> wavReaderSource;
+    std::unique_ptr<juce::LoopingAudioSource> wavLoopSource;
 
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
@@ -381,6 +524,7 @@ private:
     juce::TextEditor logBox;
     juce::TextButton closeButton;
     bool dropActive = false;
+    bool wavActive = false;
 
     static juce::File appData()
     {
@@ -395,12 +539,12 @@ private:
     {
         const bool build = buildMode.getToggleState();
 
-        modeLabel.setText(build ? "BUILD → CACHE → LAUNCH"
+        modeLabel.setText(build ? "BUILD > CACHE > LAUNCH"
                                 : "NATIVE VST3 PLAYER",
                            juce::dontSendNotification);
 
-        status.setText(build ? "Drop an extracted GitHub/CMake project folder"
-                             : "Drop a .vst3 folder",
+        status.setText(build ? "Drop a GitHub project folder or ZIP"
+                             : "Drop a .vst3 folder or ZIP",
                        juce::dontSendNotification);
         repaint();
     }
@@ -422,14 +566,36 @@ private:
         if (dropped.getChildFile("CMakeLists.txt").existsAsFile())
             return dropped;
 
-        juce::Array<juce::File> children;
-        juce::DirectoryIterator it(dropped, false, "*", juce::File::findDirectories);
-        while (it.next())
-            children.add(it.getFile());
+        // GitHub ZIPs commonly add one or more repository-name folders.
+        // Search a few levels deep without walking huge build trees.
+        juce::Array<juce::File> queue;
+        queue.add(dropped);
 
-        for (auto& child : children)
-            if (child.getChildFile("CMakeLists.txt").existsAsFile())
-                return child;
+        for (int depth = 0; depth < 4 && !queue.isEmpty(); ++depth)
+        {
+            juce::Array<juce::File> next;
+
+            for (const auto& parent : queue)
+            {
+                juce::DirectoryIterator it(parent, false, "*", juce::File::findDirectories);
+                while (it.next())
+                {
+                    const auto child = it.getFile();
+
+                    if (child.getChildFile("CMakeLists.txt").existsAsFile())
+                        return child;
+
+                    // Ignore generated/dependency directories while locating the source.
+                    const auto name = child.getFileName();
+                    if (!name.equalsIgnoreCase("build")
+                        && !name.equalsIgnoreCase(".git")
+                        && !name.equalsIgnoreCase("node_modules"))
+                        next.add(child);
+                }
+            }
+
+            queue = std::move(next);
+        }
 
         return {};
     }
@@ -449,6 +615,11 @@ private:
         while (it.next())
             if (it.getFile().isDirectory())
                 found.add(it.getFile());
+
+        std::sort(found.begin(), found.end(), [](const juce::File& a, const juce::File& b)
+        {
+            return a.getFullPathName().length() < b.getFullPathName().length();
+        });
 
         return found.isEmpty() ? juce::File() : found.getFirst();
     }
@@ -500,9 +671,10 @@ private:
             return;
         }
 
+        stopWav();
         closePlugin();
         logBox.clear();
-        status.setText("Preparing incremental build…", juce::dontSendNotification);
+        status.setText("Preparing incremental build...", juce::dontSendNotification);
 
         auto name = source.getFileName().replaceCharacters(" ", "_")
                     .replaceCharacters("\\/:*?\"<>|", "_________");
@@ -521,8 +693,8 @@ private:
 
             if (!cached.isEmpty())
             {
-                appendLog("CACHE HIT — source unchanged.");
-                status.setText("Cached build found • launching…",
+                appendLog("CACHE HIT - source unchanged.");
+                status.setText("Cached build found - launching...",
                                juce::dontSendNotification);
                 loadDroppedPlugin(cached.getFirst());
                 return;
@@ -551,6 +723,58 @@ private:
         job->startThread();
     }
 
+    void playWav(const juce::File& file)
+    {
+        closePlugin();
+        stopWav();
+
+        auto* reader = formatManager.findFormatForFileExtension("wav");
+        if (reader == nullptr)
+        {
+            status.setText("WAV support is unavailable.", juce::dontSendNotification);
+            return;
+        }
+
+        std::unique_ptr<juce::AudioFormatReader> wavReader(reader->createReaderFor(file));
+        if (wavReader == nullptr)
+        {
+            status.setText("Could not read WAV file.", juce::dontSendNotification);
+            return;
+        }
+
+        wavReaderSource = std::make_unique<juce::AudioFormatReaderSource>(wavReader.release(), true);
+        wavLoopSource = std::make_unique<juce::LoopingAudioSource>(wavReaderSource.get(), false, -1);
+
+        wavPlayer.setSource(wavLoopSource.get());
+        audioDeviceManager.removeAudioCallback(&player);
+        audioDeviceManager.addAudioCallback(&wavPlayer);
+        wavActive = true;
+
+        closeButton.setVisible(false);
+        closeButton.setEnabled(false);
+        status.setText("LOOPING WAV - " + file.getFileName() + " (Escape to stop)",
+                       juce::dontSendNotification);
+        logBox.setText("WAV playback\n\n" + file.getFullPathName() + "\n\nLooping continuously.\nPress Escape to stop.",
+                       false);
+        grabKeyboardFocus();
+        repaint();
+    }
+
+    void stopWav()
+    {
+        if (!wavActive)
+            return;
+
+        wavPlayer.setSource(nullptr);
+        wavLoopSource.reset();
+        wavReaderSource.reset();
+        audioDeviceManager.removeAudioCallback(&wavPlayer);
+        wavActive = false;
+
+        if (plugin == nullptr)
+            audioDeviceManager.addAudioCallback(&player);
+    }
+
     void loadDroppedPlugin(const juce::File& file)
     {
         if (!file.isDirectory() || !file.hasFileExtension(".vst3"))
@@ -559,6 +783,7 @@ private:
             return;
         }
 
+        stopWav();
         closePlugin();
 
         juce::AudioPluginFormat* vst3 = nullptr;
@@ -602,6 +827,8 @@ private:
 
         plugin->setRateAndBufferSizeDetails(48000.0, 512);
         player.setProcessor(plugin.get());
+        closeButton.setEnabled(true);
+        closeButton.setVisible(true);
 
         editor.reset(plugin->createEditorIfNeeded());
 
@@ -609,13 +836,19 @@ private:
         {
             addAndMakeVisible(editor.get());
             editor->setResizable(true, true);
-            status.setText("RUNNING • " + descriptions[0]->name,
-                           juce::dontSendNotification);
+            editor->addKeyListener(this);
+            buildMode.setVisible(false);
+            modeLabel.setVisible(false);
+            status.setVisible(false);
+            logBox.setVisible(false);
+            closeButton.setVisible(false);
+            editor->setWantsKeyboardFocus(true);
             resized();
+            editor->grabKeyboardFocus();
         }
         else
         {
-            status.setText("Loaded • plugin has no custom editor",
+            status.setText("Loaded - plugin has no custom editor",
                            juce::dontSendNotification);
         }
 
@@ -624,9 +857,17 @@ private:
 
     void closePlugin()
     {
+        if (editor != nullptr)
+            editor->removeKeyListener(this);
         editor.reset();
         player.setProcessor(nullptr);
         plugin.reset();
+        closeButton.setEnabled(false);
+        closeButton.setVisible(false);
+        buildMode.setVisible(true);
+        modeLabel.setVisible(true);
+        status.setVisible(true);
+        logBox.setVisible(true);
         resized();
     }
 };
@@ -641,6 +882,7 @@ public:
     {
         setContentOwned(new HostView(), true);
         setResizable(true, true);
+        setResizeLimits(760, 540, 2400, 1800);
         centreWithSize(1000, 720);
         setUsingNativeTitleBar(true);
         setVisible(true);
@@ -649,6 +891,20 @@ public:
     void closeButtonPressed() override
     {
         juce::JUCEApplication::getInstance()->systemRequestedQuit();
+    }
+
+    bool keyPressed(const juce::KeyPress& key) override
+    {
+        if (key.getKeyCode() == juce::KeyPress::escapeKey)
+        {
+            if (auto* host = dynamic_cast<HostView*>(getContentComponent()))
+            {
+                host->escapeClose();
+                return true;
+            }
+        }
+
+        return DocumentWindow::keyPressed(key);
     }
 };
 
@@ -662,7 +918,7 @@ public:
 
     const juce::String getApplicationVersion() override
     {
-        return "1.0.1";
+        return "1.0.3";
     }
 
     bool moreThanOneInstanceAllowed() override { return true; }
