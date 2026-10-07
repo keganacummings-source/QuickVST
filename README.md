@@ -14,3 +14,6 @@ When a VST3 is loaded, the builder UI is hidden and only the plugin editor is sh
 
 ## Build requirements
 Windows 10/11, CMake, and a Visual Studio/MSVC toolchain. The GitHub workflow uses MSVC x64 and Ninja.
+
+
+FIXED8: JUCE 8 compatibility fixes for WAV looping, ZIP extraction, file detection, and Escape keyboard handling.

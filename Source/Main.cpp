@@ -222,7 +222,8 @@ private:
 };
 
 class HostView final : public juce::Component,
-                       public juce::FileDragAndDropTarget
+                       public juce::FileDragAndDropTarget,
+                       public juce::KeyListener
 {
 public:
     HostView()
@@ -304,7 +305,7 @@ public:
 
         const juce::File dropped(files[0]);
 
-        if (dropped.isFile() && dropped.hasFileExtension(".wav"))
+        if (dropped.existsAsFile() && dropped.hasFileExtension(".wav"))
         {
             playWav(dropped);
             repaint();
@@ -318,14 +319,14 @@ public:
             return;
         }
 
-        if (dropped.isFile() && dropped.hasFileExtension(".vst3"))
+        if (dropped.existsAsFile() && dropped.hasFileExtension(".vst3"))
         {
             loadDroppedPlugin(dropped.getParentDirectory().getChildFile(dropped.getFileName()));
             repaint();
             return;
         }
 
-        if (dropped.isFile() && dropped.hasFileExtension(".zip"))
+        if (dropped.existsAsFile() && dropped.hasFileExtension(".zip"))
         {
             extractAndHandleZip(dropped);
             repaint();
@@ -379,11 +380,10 @@ public:
         destination.createDirectory();
 
         juce::ZipFile archive(zipFile);
-        juce::String error;
-
-        if (!archive.uncompressTo(destination, true, &error))
+        const auto unzipResult = archive.uncompressTo(destination, true);
+        if (unzipResult.failed())
         {
-            appendLog("ZIP extraction failed: " + error);
+            appendLog("ZIP extraction failed: " + unzipResult.getErrorMessage());
             status.setText("Could not extract ZIP.", juce::dontSendNotification);
             return;
         }
@@ -512,8 +512,7 @@ private:
     juce::KnownPluginList knownPlugins;
 
     juce::AudioSourcePlayer wavPlayer;
-    std::unique_ptr<juce::AudioFormatReaderSource> wavReaderSource;
-    std::unique_ptr<juce::LoopingAudioSource> wavLoopSource;
+    std::unique_ptr<juce::AudioFormatReaderSource> wavLoopSource;
 
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
@@ -728,22 +727,16 @@ private:
         closePlugin();
         stopWav();
 
-        auto* reader = formatManager.findFormatForFileExtension("wav");
-        if (reader == nullptr)
-        {
-            status.setText("WAV support is unavailable.", juce::dontSendNotification);
-            return;
-        }
-
-        std::unique_ptr<juce::AudioFormatReader> wavReader(reader->createReaderFor(file));
+        juce::WavAudioFormat wavFormat;
+        std::unique_ptr<juce::AudioFormatReader> wavReader(wavFormat.createReaderFor(file));
         if (wavReader == nullptr)
         {
             status.setText("Could not read WAV file.", juce::dontSendNotification);
             return;
         }
 
-        wavReaderSource = std::make_unique<juce::AudioFormatReaderSource>(wavReader.release(), true);
-        wavLoopSource = std::make_unique<juce::LoopingAudioSource>(wavReaderSource.get(), false, -1);
+        wavLoopSource = std::make_unique<juce::AudioFormatReaderSource>(wavReader.release(), true);
+        wavLoopSource->setLooping(true);
 
         wavPlayer.setSource(wavLoopSource.get());
         audioDeviceManager.removeAudioCallback(&player);
@@ -767,7 +760,6 @@ private:
 
         wavPlayer.setSource(nullptr);
         wavLoopSource.reset();
-        wavReaderSource.reset();
         audioDeviceManager.removeAudioCallback(&wavPlayer);
         wavActive = false;
 
