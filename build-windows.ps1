@@ -21,7 +21,6 @@ if (-not (Test-Path $devCmd)) {
     throw "VsDevCmd.bat was not found at $devCmd"
 }
 
-# Import the VS x64 environment into this PowerShell process.
 cmd.exe /s /c "`"$devCmd`" -arch=x64 -host_arch=x64 >nul && set" | ForEach-Object {
     if ($_ -match '^(.*?)=(.*)$') {
         [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
@@ -38,11 +37,33 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     throw "MSVC cl.exe was not found after loading Visual Studio."
 }
 
-cmake -S . -B $BuildDir -G Ninja `
-    -DCMAKE_BUILD_TYPE=Release `
-    -DCMAKE_C_COMPILER=cl.exe `
-    -DCMAKE_CXX_COMPILER=cl.exe
+$launcher = $null
+if (Get-Command sccache -ErrorAction SilentlyContinue) { $launcher = "sccache" }
+elseif (Get-Command ccache -ErrorAction SilentlyContinue) { $launcher = "ccache" }
 
-cmake --build $BuildDir --parallel
+$jobs = [Environment]::ProcessorCount
+if ($jobs -lt 1) { $jobs = 1 }
 
-Write-Host "Build complete." -ForegroundColor Green
+$configure = @(
+    "-S", ".",
+    "-B", $BuildDir,
+    "-G", "Ninja",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_C_COMPILER=cl.exe",
+    "-DCMAKE_CXX_COMPILER=cl.exe",
+    "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
+    "-DFETCHCONTENT_BASE_DIR=$env:LOCALAPPDATA\KyotoVST3QuickBuilder\fetchcontent"
+)
+if ($launcher) {
+    $configure += "-DCMAKE_C_COMPILER_LAUNCHER=$launcher"
+    $configure += "-DCMAKE_CXX_COMPILER_LAUNCHER=$launcher"
+    Write-Host "Compiler cache: $launcher"
+}
+
+cmake @configure
+if ($LASTEXITCODE -ne 0) { throw "CMake configure failed." }
+
+cmake --build $BuildDir --parallel $jobs
+if ($LASTEXITCODE -ne 0) { throw "Build failed." }
+
+Write-Host "Build complete ($jobs jobs, Ninja, no LTCG)." -ForegroundColor Green

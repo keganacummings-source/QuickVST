@@ -39,24 +39,50 @@ public:
 
         appendLog("CMake: " + cmake);
 
-        // Prefer Ninja when it is already installed. Otherwise use the
-        // Visual Studio 2022 generator, which requires no environment setup.
-        const auto ninja = findOnPath("ninja.exe");
+        // Ninja incremental builds are much faster than the VS generator.
+        // Also accept ninja without the .exe suffix (Git, scoop, Linux).
+        const auto ninja = findTool("ninja");
+        const auto jobs = juce::jmax(1, juce::SystemStats::getNumCpus());
+        const auto launcher = findCompilerCache();
+        const auto juceCache = appFetchCache();
         juce::String configure;
+
+        juce::String speedFlags;
+        speedFlags << " -DFETCHCONTENT_BASE_DIR=" << quote(juceCache.getFullPathName())
+                   << " -DFETCHCONTENT_UPDATES_DISCONNECTED=ON"
+                   << " -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF"
+                   << " -DCMAKE_UNITY_BUILD=ON"
+                   << " -DCMAKE_UNITY_BUILD_BATCH_SIZE=16";
+
+        if (launcher.isNotEmpty())
+        {
+            appendLog("Compiler cache: " + launcher);
+            speedFlags << " -DCMAKE_C_COMPILER_LAUNCHER=" << quote(launcher)
+                       << " -DCMAKE_CXX_COMPILER_LAUNCHER=" << quote(launcher);
+        }
+
+        // Release without /GL /LTCG. Whole-program optimization dominates
+        // VST3 link time and is the usual reason a "quick" rebuild is slow.
+        speedFlags << " -DCMAKE_CXX_FLAGS_RELEASE=" << quote("/O2 /Oi /MD /DNDEBUG /MP")
+                   << " -DCMAKE_C_FLAGS_RELEASE=" << quote("/O2 /Oi /MD /DNDEBUG /MP")
+                   << " -DCMAKE_EXE_LINKER_FLAGS_RELEASE=" << quote("/INCREMENTAL:NO")
+                   << " -DCMAKE_SHARED_LINKER_FLAGS_RELEASE=" << quote("/INCREMENTAL:NO");
 
         if (ninja.isNotEmpty())
         {
-            appendLog("Generator: Ninja (fast incremental mode)");
+            appendLog("Generator: Ninja, " + juce::String(jobs) + " jobs, unity build, no LTCG");
             configure = quote(cmake) + " -S " + quote(source.getFullPathName())
                       + " -B " + quote(buildDir.getFullPathName())
-                      + " -G Ninja -DCMAKE_BUILD_TYPE=Release";
+                      + " -G Ninja -DCMAKE_BUILD_TYPE=Release"
+                      + speedFlags;
         }
         else
         {
-            appendLog("Generator: Visual Studio 17 2022 (Ninja not installed)");
+            appendLog("Generator: Visual Studio 17 2022 /MP (install Ninja for a faster rebuild)");
             configure = quote(cmake) + " -S " + quote(source.getFullPathName())
                       + " -B " + quote(buildDir.getFullPathName())
-                      + " -G \"Visual Studio 17 2022\" -A x64";
+                      + " -G \"Visual Studio 17 2022\" -A x64"
+                      + speedFlags;
         }
 
         appendLog("");
@@ -72,13 +98,8 @@ public:
         if (threadShouldExit())
             return;
 
-        juce::String buildCommand;
-        if (ninja.isNotEmpty())
-            buildCommand = quote(cmake) + " --build " + quote(buildDir.getFullPathName())
-                         + " --parallel";
-        else
-            buildCommand = quote(cmake) + " --build " + quote(buildDir.getFullPathName())
-                         + " --config Release --parallel";
+        juce::String buildCommand = quote(cmake) + " --build " + quote(buildDir.getFullPathName())
+                                  + " --config Release --parallel " + juce::String(jobs);
 
         appendLog("");
         appendLog("> " + buildCommand);
@@ -142,6 +163,31 @@ private:
     static juce::String quote(const juce::String& value)
     {
         return "\"" + value.replace("\"", "\\\"") + "\"";
+    }
+
+    static juce::File appFetchCache()
+    {
+        auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                       .getChildFile("KyotoVST3QuickBuilder")
+                       .getChildFile("fetchcontent");
+        dir.createDirectory();
+        return dir;
+    }
+
+    static juce::String findTool(const juce::String& name)
+    {
+        auto found = findOnPath(name);
+        if (found.isEmpty() && !name.endsWithIgnoreCase(".exe"))
+            found = findOnPath(name + ".exe");
+        return found;
+    }
+
+    static juce::String findCompilerCache()
+    {
+        auto sccache = findTool("sccache");
+        if (sccache.isNotEmpty())
+            return sccache;
+        return findTool("ccache");
     }
 
     static juce::String findOnPath(const juce::String& exe)
@@ -222,7 +268,8 @@ private:
 };
 
 class HostView final : public juce::Component,
-                       public juce::FileDragAndDropTarget
+                       public juce::FileDragAndDropTarget,
+                       public juce::KeyListener
 {
 public:
     HostView()
@@ -304,7 +351,7 @@ public:
 
         const juce::File dropped(files[0]);
 
-        if (dropped.isFile() && dropped.hasFileExtension(".wav"))
+        if (dropped.existsAsFile() && dropped.hasFileExtension(".wav"))
         {
             playWav(dropped);
             repaint();
@@ -318,14 +365,14 @@ public:
             return;
         }
 
-        if (dropped.isFile() && dropped.hasFileExtension(".vst3"))
+        if (dropped.existsAsFile() && dropped.hasFileExtension(".vst3"))
         {
             loadDroppedPlugin(dropped.getParentDirectory().getChildFile(dropped.getFileName()));
             repaint();
             return;
         }
 
-        if (dropped.isFile() && dropped.hasFileExtension(".zip"))
+        if (dropped.existsAsFile() && dropped.hasFileExtension(".zip"))
         {
             extractAndHandleZip(dropped);
             repaint();
@@ -379,11 +426,10 @@ public:
         destination.createDirectory();
 
         juce::ZipFile archive(zipFile);
-        juce::String error;
-
-        if (!archive.uncompressTo(destination, true, &error))
+        const auto unzipResult = archive.uncompressTo(destination, true);
+        if (unzipResult.failed())
         {
-            appendLog("ZIP extraction failed: " + error);
+            appendLog("ZIP extraction failed: " + unzipResult.getErrorMessage());
             status.setText("Could not extract ZIP.", juce::dontSendNotification);
             return;
         }
@@ -513,7 +559,6 @@ private:
 
     juce::AudioSourcePlayer wavPlayer;
     std::unique_ptr<juce::AudioFormatReaderSource> wavReaderSource;
-    std::unique_ptr<juce::LoopingAudioSource> wavLoopSource;
 
     std::unique_ptr<juce::AudioPluginInstance> plugin;
     std::unique_ptr<juce::AudioProcessorEditor> editor;
@@ -728,14 +773,8 @@ private:
         closePlugin();
         stopWav();
 
-        auto* reader = formatManager.findFormatForFileExtension("wav");
-        if (reader == nullptr)
-        {
-            status.setText("WAV support is unavailable.", juce::dontSendNotification);
-            return;
-        }
-
-        std::unique_ptr<juce::AudioFormatReader> wavReader(reader->createReaderFor(file));
+        juce::WavAudioFormat wavFormat;
+        std::unique_ptr<juce::AudioFormatReader> wavReader(wavFormat.createReaderFor(file.createInputStream().release(), true));
         if (wavReader == nullptr)
         {
             status.setText("Could not read WAV file.", juce::dontSendNotification);
@@ -743,9 +782,8 @@ private:
         }
 
         wavReaderSource = std::make_unique<juce::AudioFormatReaderSource>(wavReader.release(), true);
-        wavLoopSource = std::make_unique<juce::LoopingAudioSource>(wavReaderSource.get(), false, -1);
-
-        wavPlayer.setSource(wavLoopSource.get());
+        wavReaderSource->setLooping(true);
+        wavPlayer.setSource(wavReaderSource.get());
         audioDeviceManager.removeAudioCallback(&player);
         audioDeviceManager.addAudioCallback(&wavPlayer);
         wavActive = true;
@@ -766,7 +804,6 @@ private:
             return;
 
         wavPlayer.setSource(nullptr);
-        wavLoopSource.reset();
         wavReaderSource.reset();
         audioDeviceManager.removeAudioCallback(&wavPlayer);
         wavActive = false;
@@ -918,7 +955,7 @@ public:
 
     const juce::String getApplicationVersion() override
     {
-        return "1.0.3";
+        return "1.0.4";
     }
 
     bool moreThanOneInstanceAllowed() override { return true; }
