@@ -14,26 +14,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Ninja
+      # JUCE 8 does not support MinGW on Windows. This action exposes the
+      # Microsoft x64 compiler environment to CMake/Ninja so CMake cannot
+      # accidentally select C:/mingw64/bin/cc.exe.
+      - name: Enable MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify Microsoft compiler
         shell: pwsh
-        run: choco install ninja -y --no-progress
+        run: |
+          Write-Host "Compiler:" 
+          where.exe cl.exe
+          cl.exe 2>&1 | Select-Object -First 3
+          Write-Host "CMake:" 
+          cmake --version
+          Write-Host "Ninja:" 
+          ninja --version
 
       - name: Cache JUCE
         uses: actions/cache@v4
         with:
           path: C:\kyoto-juce-cache
-          key: juce-8.0.6-windows-v1
+          key: juce-8.0.6-windows-msvc-x64-v2
 
-      - name: Configure
+      - name: Configure with MSVC + Ninja
         shell: pwsh
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DFETCHCONTENT_BASE_DIR=C:/kyoto-juce-cache
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl.exe `
+            -DCMAKE_CXX_COMPILER=cl.exe `
+            -DFETCHCONTENT_BASE_DIR=C:/kyoto-juce-cache
 
       - name: Build
         shell: pwsh
-        run: cmake --build build --parallel
+        run: |
+          cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: Locate EXE
         shell: pwsh
@@ -48,7 +66,7 @@ jobs:
         run: |
           @"
           Kyoto VST3 Quick Builder
-          Windows x64
+          Windows x64 / MSVC
 
           BUILD MODE:
           Drop an extracted CMake/GitHub VST3 project onto the window.
@@ -58,10 +76,7 @@ jobs:
           PLAYER MODE:
           Turn BUILD MODE off and drop any Windows .vst3 folder to load it natively.
 
-          Requirements for BUILD MODE:
-          - Visual Studio 2022 C++ tools
-          - CMake
-          - Git/network access for the first JUCE download
+          The GitHub builder uses Microsoft MSVC x64 because JUCE 8 does not support MinGW.
           "@ | Set-Content release\README.txt
 
           Compress-Archive -Path release\* -DestinationPath KyotoVST3QuickBuilder-Windows-x64.zip -Force
