@@ -50,9 +50,9 @@ jobs:
       - name: Locate EXE
         shell: pwsh
         run: |
-          $exe = Get-ChildItem build -Recurse -Filter "KyotoVST3QuickBuilder.exe" |
+          $exe = Get-ChildItem build -Recurse -Filter "*Quick Builder.exe" |
             Select-Object -First 1
-          if (-not $exe) { throw "KyotoVST3QuickBuilder.exe was not produced." }
+          if (-not $exe) { throw "Kyoto VST3 Quick Builder.exe was not produced." }
           New-Item -ItemType Directory -Force release | Out-Null
           Copy-Item $exe.FullName release\KyotoVST3QuickBuilder.exe
 
