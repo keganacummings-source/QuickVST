@@ -1,0 +1,81 @@
+name: Build Kyoto VST3 Quick Builder
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: C:\kyoto-juce-cache
+          key: juce-8.0.6-windows-v1
+
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DFETCHCONTENT_BASE_DIR=C:/kyoto-juce-cache
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --parallel
+
+      - name: Locate EXE
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem build -Recurse -Filter "KyotoVST3QuickBuilder.exe" | Select-Object -First 1
+          if (-not $exe) { throw "KyotoVST3QuickBuilder.exe was not produced." }
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item $exe.FullName release\KyotoVST3QuickBuilder.exe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          @"
+          Kyoto VST3 Quick Builder
+          Windows x64
+
+          BUILD MODE:
+          Drop an extracted CMake/GitHub VST3 project onto the window.
+          The builder configures, compiles, saves the .vst3 in its local cache,
+          reports errors in the build console, and opens the result automatically.
+
+          PLAYER MODE:
+          Turn BUILD MODE off and drop any Windows .vst3 folder to load it natively.
+
+          Requirements for BUILD MODE:
+          - Visual Studio 2022 C++ tools
+          - CMake
+          - Git/network access for the first JUCE download
+          "@ | Set-Content release\README.txt
+
+          Compress-Archive -Path release\* -DestinationPath KyotoVST3QuickBuilder-Windows-x64.zip -Force
+
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: KyotoVST3QuickBuilder-Windows-x64
+          path: |
+            release/KyotoVST3QuickBuilder.exe
+            release/README.txt
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: KyotoVST3QuickBuilder-Windows-x64-ZIP
+          path: KyotoVST3QuickBuilder-Windows-x64.zip
